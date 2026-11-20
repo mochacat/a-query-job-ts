@@ -23,20 +23,33 @@ function dbExec(db: Database, sql: string): Promise<void> {
 
 // ── Chunking ────────────────────────────────────────────────────────
 function chunkText(text: string, fileName: string, chunkSize: number, chunkOverlap: number): RawChunk[] {
-  const paragraphs = text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+  // Split on sentence boundaries (period, question mark, exclamation followed by space/newline)
+  const sentences = text
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
   const chunks: RawChunk[] = [];
   let current = "";
   let index = 0;
 
-  for (const para of paragraphs) {
-    if (current.length + para.length > chunkSize && current.length > 0) {
-      chunks.push(RawChunkSchema.parse({ fileName, chunkIndex: index++, text: current }));
-      current = current.slice(-chunkOverlap) + "\n\n" + para;
+  for (const sentence of sentences) {
+    // If adding this sentence would exceed the limit and we have content, flush
+    if (current.length + sentence.length > chunkSize && current.length > 0) {
+      chunks.push(RawChunkSchema.parse({ fileName, chunkIndex: index++, text: current.trim() }));
+      // overlap: keep the last chunkOverlap chars worth of trailing sentences
+      const overlapSentences: string[] = [];
+      let overlapLen = 0;
+      for (const s of current.split(/(?<=[.!?])\s+/).reverse()) {
+        if (overlapLen + s.length > chunkOverlap && overlapSentences.length > 0) break;
+        overlapSentences.unshift(s);
+        overlapLen += s.length;
+      }
+      current = overlapSentences.join(" ") + " " + sentence;
     } else {
-      current += (current ? "\n\n" : "") + para;
+      current += (current ? " " : "") + sentence;
     }
   }
-  if (current) chunks.push(RawChunkSchema.parse({ fileName, chunkIndex: index, text: current }));
+  if (current.trim()) chunks.push(RawChunkSchema.parse({ fileName, chunkIndex: index, text: current.trim() }));
   return chunks;
 }
 
