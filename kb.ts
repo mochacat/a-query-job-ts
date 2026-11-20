@@ -1,9 +1,9 @@
 import duckdb from "duckdb";
-const Database = duckdb.Database;
 import OpenAI from "openai";
 import dotenv from "dotenv";
 import fs from "node:fs";
 import path from "node:path";
+import { loadConfig, RawChunk, RawChunkSchema, Config } from "./schemas/index.js";
 
 // Suppress dotenv stderr noise
 const stderr = process.stderr.write;
@@ -11,71 +11,55 @@ process.stderr.write = () => true;
 dotenv.config({ path: path.resolve(import.meta.dirname, ".env") });
 process.stderr.write = stderr;
 
-// ── Config ──────────────────────────────────────────────────────────
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const OPENROUTER_MODEL = process.env.OPENROUTER_EMBEDDING_MODEL ?? "openai/text-embedding-3-small";
-const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+type Database = duckdb.Database;
+type Callback<T> = (err: duckdb.DuckDbError | null) => void;
 
-const DB_PATH = path.resolve(import.meta.dirname, "knowledge.db");
-const DOCS_DIR = path.resolve(import.meta.dirname, "docs");
-const CHUNK_SIZE = 512;
-const CHUNK_OVERLAP = 64;
-const EMBEDDING_DIMS = 1536; // text-embedding-3-small
-
-type DB = InstanceType<typeof Database>;
-
-// ── Init OpenAI (OpenRouter) ───────────────────────────────────────
-const openai = new OpenAI({ apiKey: OPENROUTER_API_KEY, baseURL: OPENROUTER_BASE_URL });
-
-// ── DuckDB helper ──────────────────────────────────────────────────
-function dbExec(db: DB, sql: string): Promise<void> {
+// ── DuckDB promisified helpers ──────────────────────────────────────
+function dbExec(db: Database, sql: string): Promise<void> {
   return new Promise((resolve, reject) =>
     db.exec(sql, (err) => (err ? reject(err) : resolve())),
   );
 }
 
 // ── Chunking ────────────────────────────────────────────────────────
-function chunkText(text: string, fileName: string): { fileName: string; chunkIndex: number; text: string }[] {
+function chunkText(text: string, fileName: string, chunkSize: number, chunkOverlap: number): RawChunk[] {
   const paragraphs = text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
-  const chunks: { fileName: string; chunkIndex: number; text: string }[] = [];
+  const chunks: RawChunk[] = [];
   let current = "";
   let index = 0;
 
   for (const para of paragraphs) {
-    if (current.length + para.length > CHUNK_SIZE && current.length > 0) {
-      chunks.push({ fileName, chunkIndex: index++, text: current });
-      current = current.slice(-CHUNK_OVERLAP) + "\n\n" + para;
+    if (current.length + para.length > chunkSize && current.length > 0) {
+      chunks.push(RawChunkSchema.parse({ fileName, chunkIndex: index++, text: current }));
+      current = current.slice(-chunkOverlap) + "\n\n" + para;
     } else {
       current += (current ? "\n\n" : "") + para;
     }
   }
-  if (current) chunks.push({ fileName, chunkIndex: index, text: current });
+  if (current) chunks.push(RawChunkSchema.parse({ fileName, chunkIndex: index, text: current }));
   return chunks;
 }
 
-// ── Embedding ──────────────────────────────────────────────────────
-async function embed(texts: string[]): Promise<number[][]> {
-  const resp = await openai.embeddings.create({
-    model: OPENROUTER_MODEL,
-    input: texts,
-  });
-  return resp.data.map((d) => d.embedding);
+// ── Escape single-quoted SQL string ──────────────────────────────────
+function sqlEscape(val: string): string {
+  return val.replace(/'/g, "''");
 }
 
 // ── Main ────────────────────────────────────────────────────────────
 async function main() {
-  if (!OPENROUTER_API_KEY) {
-    console.error("Set OPENROUTER_API_KEY environment variable");
-    process.exit(1);
-  }
+  const config: Config = loadConfig({
+    dbPath: path.resolve(import.meta.dirname, "knowledge.db"),
+    docsDir: path.resolve(import.meta.dirname, "docs"),
+  });
 
-  if (!fs.existsSync(DOCS_DIR)) {
-    fs.mkdirSync(DOCS_DIR, { recursive: true });
-    console.log(`Created docs directory at ${DOCS_DIR}`);
+  if (!fs.existsSync(config.docsDir)) {
+    fs.mkdirSync(config.docsDir, { recursive: true });
+    console.log(`Created docs directory at ${config.docsDir}`);
     console.log("   Put .txt files in there and run again.\n");
+    return;
   }
 
-  const db = new Database(DB_PATH);
+  const db: Database = new duckdb.Database(config.dbPath);
 
   // Enable VSS extension
   await dbExec(db, "INSTALL vss");
@@ -88,53 +72,60 @@ async function main() {
       file_name TEXT NOT NULL,
       chunk_idx INTEGER NOT NULL,
       content   TEXT NOT NULL,
-      embedding FLOAT[${EMBEDDING_DIMS}]
+      embedding FLOAT[${config.embeddingDims}]
     )
   `);
   await dbExec(db, "CREATE SEQUENCE IF NOT EXISTS chunks_seq START 1");
 
-  const txtFiles = fs.readdirSync(DOCS_DIR).filter((f) => f.endsWith(".txt"));
+  // Read .txt files
+  const txtFiles: string[] = fs.readdirSync(config.docsDir).filter((f) => f.endsWith(".txt"));
   if (txtFiles.length === 0) {
     console.log("No .txt files found in docs/");
-    await new Promise(r => db.close(r));
+    await new Promise<void>((resolve) => db.close(() => resolve()));
     return;
   }
 
   console.log(`Found ${txtFiles.length} file(s), chunking...`);
 
-  const allChunks: { fileName: string; chunkIndex: number; text: string }[] = [];
-  for (const f of txtFiles) {
-    const content = fs.readFileSync(path.join(DOCS_DIR, f), "utf-8");
-    allChunks.push(...chunkText(content, f));
-  }
+  // Chunk all files
+  const allChunks: RawChunk[] = txtFiles.flatMap((f) => {
+    const content = fs.readFileSync(path.join(config.docsDir, f), "utf-8");
+    return chunkText(content, f, config.chunkSize, config.chunkOverlap);
+  });
   console.log(`Split into ${allChunks.length} chunk(s)`);
 
-  // Embed in batches
-  const BATCH = 20;
+  // Embed in batches via OpenRouter
+  const openai = new OpenAI({
+    apiKey: config.openRouterApiKey,
+    baseURL: config.openRouterBaseUrl,
+  });
+
   const embeddings: number[][] = [];
-  for (let i = 0; i < allChunks.length; i += BATCH) {
-    const batch = allChunks.slice(i, i + BATCH);
+  for (let i = 0; i < allChunks.length; i += config.embedBatchSize) {
+    const batch = allChunks.slice(i, i + config.embedBatchSize);
     const texts = batch.map((c) => c.text);
-    process.stdout.write(`Embedding batch ${Math.floor(i / BATCH) + 1}/${Math.ceil(allChunks.length / BATCH)}...`);
-    const vecs = await embed(texts);
-    embeddings.push(...vecs);
+    process.stdout.write(`Embedding batch ${Math.floor(i / config.embedBatchSize) + 1}/${Math.ceil(allChunks.length / config.embedBatchSize)}...`);
+    const resp = await openai.embeddings.create({
+      model: config.openRouterModel,
+      input: texts,
+    });
+    embeddings.push(...resp.data.map((d) => d.embedding));
     console.log(" done");
   }
 
-  // Wipe old data and insert with proper FLOAT[] casting
+  // Wipe old data and insert
   await dbExec(db, "DELETE FROM chunks");
   for (let i = 0; i < allChunks.length; i++) {
     const c = allChunks[i];
-    const escaped = c.text.replace(/'/g, "''");
     const vecStr = JSON.stringify(embeddings[i]);
     await dbExec(
       db,
-      `INSERT INTO chunks VALUES (nextval('chunks_seq'), '${c.fileName.replace(/'/g, "''")}', ${c.chunkIndex}, '${escaped}', '${vecStr}'::FLOAT[${EMBEDDING_DIMS}])`,
+      `INSERT INTO chunks VALUES (nextval('chunks_seq'), '${sqlEscape(c.fileName)}', ${c.chunkIndex}, '${sqlEscape(c.text)}', '${vecStr}'::FLOAT[${config.embeddingDims}])`,
     );
   }
   console.log(`Stored ${allChunks.length} chunk(s) in DuckDB`);
 
-  await new Promise(r => db.close(r));
+  await new Promise<void>((resolve) => db.close(() => resolve()));
 }
 
 main().catch((err) => {
